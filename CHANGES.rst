@@ -8,6 +8,13 @@ Changelog
   ``RerunPolicy`` to give a specific failure class its own rerun count /
   all-reruns-need-to-pass mode, without changing how other failures are rerun.
 
+- Fixed session, module and class fixtures being torn down between the attempts
+  of an all-reruns-need-to-pass sequence when the test is the last one of a worker
+  or of its module, and being left alive after the final attempt when a rerun
+  policy lowers the rerun count. They now stay alive exactly while another attempt
+  follows. Without all-reruns-need-to-pass this changes behavior only for tests
+  whose policy sets a rerun count different from the configured one.
+
 
 16.3 (2026-05-22)
 -----------------
