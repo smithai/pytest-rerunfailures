@@ -29,7 +29,7 @@ Requirements
 You will need the following prerequisites in order to use pytest-rerunfailures:
 
 - Python 3.10+ or PyPy3
-- pytest 8.1 or newer
+- pytest 8.2 or newer
 
 This plugin can recover from a hard crash with the following optional
 prerequisites:
@@ -72,8 +72,6 @@ maximum number of times you'd like the tests to run:
 
   $ pytest --reruns 5
 
-Failed fixture or setup_class will also be re-executed.
-
 To add a delay time between re-runs use the ``--reruns-delay`` command line
 option with the amount of seconds that you would like wait before the next
 test re-run is launched:
@@ -81,6 +79,28 @@ test re-run is launched:
 .. code-block:: bash
 
    $ pytest --reruns 5 --reruns-delay 1
+
+To grow the delay after every attempt (exponential backoff), use the
+``--reruns-delay-backoff-factor`` option. The delay before the *n*-th re-run is
+``reruns_delay * reruns_delay_backoff_factor ** (n - 1)``. The default factor is
+``1.0``, which keeps the delay constant. For example, the following waits 1, 2
+and 4 seconds before the three re-runs:
+
+.. code-block:: bash
+
+   $ pytest --reruns 3 --reruns-delay 1 --reruns-delay-backoff-factor 2
+
+.. START-FIXTURES
+
+Fixture support
+---------------
+
+Failures during fixture setup or ``setup_class`` are also rerun. This includes
+class-, module-, package-, and session-scoped fixtures. A rerun repeats only
+the affected test item: fixtures that have already completed setup remain
+cached at their scope and are torn down once after reruns.
+
+.. END-FIXTURES
 
 Re-run all failures matching certain expressions
 ------------------------------------------------
@@ -100,6 +120,24 @@ would only rerun those errors that match ``AssertionError`` or ``ValueError``:
 
    $ pytest --reruns 5 --only-rerun AssertionError --only-rerun ValueError
 
+The same matching is applied to each exception in the ``__cause__`` /
+``__context__`` chain, so a wrapped error such as
+``raise RuntimeError(...) from MemoryError(...)`` is still rerun by
+``--only-rerun MemoryError``.
+
+The default list can also live in the ``pytest.ini`` (or ``pyproject.toml``)
+file, one expression per line:
+
+.. code-block:: ini
+
+   [pytest]
+   only_rerun =
+       AssertionError
+       ValueError
+
+A ``--only-rerun`` flag on the command line replaces the ini list rather than
+accumulating with it.
+
 Re-run all failures other than matching certain expressions
 -----------------------------------------------------------
 
@@ -118,6 +156,28 @@ would only rerun those errors that does not match with ``AssertionError`` or ``O
 
    $ pytest --reruns 5 --rerun-except AssertionError --rerun-except OSError
 
+Matching for ``--rerun-except`` follows explicit ``__cause__`` links
+(``raise ... from ...``), so ``raise RuntimeError(...) from ValueError(...)``
+is excluded by ``--rerun-except ValueError``. Implicit ``__context__`` from
+``except`` / ``finally`` is not walked, so a ``ConnectionError`` raised inside
+``except AssertionError`` is still rerun by ``--rerun-except AssertionError``.
+
+The exclusion list can also live in the ``pytest.ini`` (or
+``pyproject.toml``) file as ``rerun_except``, one expression per line.
+
+Exclude test paths from re-runs
+--------------------------------
+
+To exclude a test file or all tests under a directory from re-runs, use the
+``--rerun-exclude-path`` option. Relative paths are interpreted relative to
+pytest's root directory:
+
+.. code-block:: bash
+
+   $ pytest --reruns 3 --rerun-exclude-path docs
+
+The option may be passed multiple times to exclude multiple paths.
+
 Re-run individual failures
 --------------------------
 
@@ -132,14 +192,36 @@ test to run:
       import random
       assert random.choice([True, False])
 
+To disable re-runs for a single test while keeping global re-runs enabled,
+use ``reruns=0``. Since the marker takes priority over the global setting,
+this test will not be re-run even when ``--reruns`` is passed:
+
+.. code-block:: python
+
+  @pytest.mark.flaky(reruns=0)
+  def test_example():
+      assert foo() == bar()
+
+Note that ``--force-reruns`` still overrides the marker, and with
+``--reruns-mode=append`` the marker count is added to the global count, so
+``reruns=0`` does not opt the test out in that mode.
+
 Note that when teardown fails, two reports are generated for the case, one for
 the test case and the other for the teardown error.
 
-You can also specify the re-run delay time in the marker:
+You can also specify the re-run delay time in the marker, as well as the
+backoff factor for an exponential backoff:
 
 .. code-block:: python
 
   @pytest.mark.flaky(reruns=5, reruns_delay=2)
+  def test_example():
+      import random
+      assert random.choice([True, False])
+
+.. code-block:: python
+
+  @pytest.mark.flaky(reruns=5, reruns_delay=2, reruns_delay_backoff_factor=2)
   def test_example():
       import random
       assert random.choice([True, False])
@@ -220,6 +302,22 @@ setting. To make them additive instead, pass ``--reruns-mode=append``. With
 
    $ pytest --reruns 4 --reruns-mode append
 
+Limit total reruns across the suite
+------------------------------------
+
+To cap the total number of reruns across the entire test suite regardless of
+how many individual tests fail, pass ``--max-suite-reruns``. Once the limit
+is reached, no further reruns occur even if individual tests have remaining
+reruns:
+
+.. code-block:: bash
+
+   $ pytest --reruns 3 --max-suite-reruns 10
+
+This is useful in large test suites to bound resource usage when many tests
+are flaky at the same time. The cap applies after rerun selection, including
+tests configured with ``--force-reruns`` and ``@pytest.mark.flaky``.
+
 Show tracebacks for retried failures
 ------------------------------------
 
@@ -280,6 +378,7 @@ Here's an example of the output provided by the plugin when run with
   ============================ rerun test summary info =========================
   RERUN test_report.py::test_fail
   RERUN test_report.py::test_fail
+  FAILED test_report.py::test_fail
   ============================ short test summary info =========================
   FAIL test_report.py::test_fail
   ======================= 1 failed, 2 rerun in 0.02 seconds ====================
@@ -293,7 +392,12 @@ Compatibility
 -------------
 
 * This plugin is *not* compatible with pytest-xdist's --looponfail flag.
-* This plugin is *not* compatible with the core --pdb flag.
+* This plugin is *not* compatible with
+  `pytest-forked <https://pypi.org/project/pytest-forked/>`_: both plugins
+  override ``pytest_runtest_protocol``, and whichever runs first prevents
+  the other from working, so tests are not re-run.
+* When the core --pdb flag is used, reruns are disabled (a warning is
+  emitted and tests are run once, as if ``--reruns 0`` was passed).
 * This plugin is *not* compatible with the plugin
   `flaky <https://pypi.org/project/flaky/>`_, you can only have
   ``pytest-rerunfailures`` or ``flaky`` but not both.
@@ -311,6 +415,10 @@ which one takes priority?
 * Top priority is the marker, such as ``@pytest.mark.flaky(reruns=1)``
 * Second priority is what's specified on the command line, like ``--reruns=2``
 * Last priority is the ``pyproject.toml`` (or ``pytest.ini``) file setting, like ``reruns = 3``
+
+The same order applies to the rerun filters: a marker's ``only_rerun`` /
+``rerun_except`` beats ``--only-rerun`` / ``--rerun-except`` on the command
+line, which in turn beats the ``only_rerun`` / ``rerun_except`` ini settings.
 
 Additionally, all three can be overridden by passing ``--force-reruns`` argument
 on the command line. Passing ``--reruns-mode=append`` makes the marker count and
