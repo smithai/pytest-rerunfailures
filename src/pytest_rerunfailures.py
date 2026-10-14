@@ -436,6 +436,49 @@ def _should_not_rerun(item, report, reruns):
     )
 
 
+def _get_rerun_settings(item):
+    """Return the (reruns, all_reruns_need_to_pass) in force for item.
+
+    The configured values, overridden by the item's per-failure rerun policy once it
+    has one.
+    """
+    reruns = get_reruns_count(item)
+    all_reruns_need_to_pass = get_all_reruns_need_to_pass(item)
+    policy = getattr(item, "_rerunfailures_policy", None)
+    if policy is not None:
+        if policy.reruns is not None:
+            reruns = policy.reruns
+        if policy.all_reruns_need_to_pass is not None:
+            all_reruns_need_to_pass = policy.all_reruns_need_to_pass
+    return reruns, all_reruns_need_to_pass
+
+
+def _will_rerun(item):
+    """Return whether another attempt of item follows the one in progress.
+
+    pytest_runtest_teardown asks this to keep higher-scoped fixtures alive for that
+    attempt, and the all-reruns-need-to-pass branch of the protocol loop to find the
+    last attempt. The teardown runs before the loop decides, so the answer comes from
+    the attempt's setup and call phases. An all-reruns-need-to-pass sequence reruns
+    after a passing attempt too; otherwise only a failure reruns, as in
+    _should_not_rerun, which the loop uses for those items.
+    """
+    reruns, all_reruns_need_to_pass = _get_rerun_settings(item)
+    _test_failed_statuses = getattr(item, "_test_failed_statuses", {})
+    if all_reruns_need_to_pass and getattr(item, "_initial_call_failed", False):
+        # every attempt that reaches its call phase is followed by a rerun until the
+        # reruns are used up, whatever its outcome
+        return item.execution_count <= reruns and "call" in _test_failed_statuses
+    # Exceeding re-run limits, being free of failure statuses, encountering allowable
+    # exceptions, and a false condition indicate that the test is not to be re-ran.
+    return (
+        item.execution_count <= reruns
+        and any(_test_failed_statuses.values())
+        and not any(item._terminal_errors.values())
+        and get_reruns_condition(item)
+    )
+
+
 def is_master(config):
     return not (hasattr(config, "workerinput") or hasattr(config, "slaveinput"))
 
@@ -625,16 +668,9 @@ def pytest_runtest_teardown(item, nextitem):
         # -> teardown needs to be skipped as well
         return
 
-    _test_failed_statuses = getattr(item, "_test_failed_statuses", {})
-
     # Only remove non-function level actions from the stack if the test is to be re-run
-    # Exceeding re-run limits, being free of failue statuses, and encountering
-    # allowable exceptions indicate that the test is not to be re-ran.
-    if (
-        item.execution_count <= reruns
-        and any(_test_failed_statuses.values())
-        and not any(item._terminal_errors.values())
-    ):
+    # (see _will_rerun for what that takes).
+    if _will_rerun(item):
         # clean cached results from any level of setups
         _remove_cached_results_from_failed_fixtures(item)
 
@@ -669,6 +705,16 @@ def pytest_runtest_makereport(item, call):
         item, result, call.excinfo
     )
 
+    # A failing call on the first attempt starts an all-reruns-need-to-pass sequence.
+    # Recorded here because the teardown that follows needs it before the protocol
+    # loop sees this report.
+    if (
+        result.when == "call"
+        and result.failed
+        and getattr(item, "execution_count", None) == 1
+    ):
+        item._initial_call_failed = True
+
     # On the first failure, ask plugins for a per-failure rerun policy so the protocol
     # can give this failure class its own rerun count / semantics.
     if result.failed and not hasattr(item, "_rerunfailures_policy"):
@@ -698,13 +744,13 @@ def pytest_runtest_protocol(item, nextitem):
     parallel = not is_master(item.config)
     db = item.session.config.failures_db
     item.execution_count = db.get_test_failures(item.nodeid)
+    item._initial_call_failed = False
     db.set_test_reruns(item.nodeid, reruns)
 
     if item.execution_count > reruns:
         return True
 
     # Track rerun results when all reruns need to pass
-    initial_failure_occurred = False
     rerun_results = []  # Track result of each rerun (True=passed, False=failed)
     policy_applied = False
 
@@ -713,6 +759,7 @@ def pytest_runtest_protocol(item, nextitem):
         item.execution_count += 1
         item.ihook.pytest_runtest_logstart(nodeid=item.nodeid, location=item.location)
         reports = runtestprotocol(item, nextitem=nextitem, log=False)
+        initial_failure_occurred = getattr(item, "_initial_call_failed", False)
 
         # Apply a per-failure rerun policy (pytest_rerunfailures_rerun_policy) once the
         # first attempt has run and makereport has classified its failure. Lets a plugin
@@ -722,23 +769,11 @@ def pytest_runtest_protocol(item, nextitem):
             policy = getattr(item, "_rerunfailures_policy", None)
             if policy is not None:
                 policy_applied = True
-                if policy.reruns is not None:
-                    reruns = policy.reruns
-                    db.set_test_reruns(item.nodeid, reruns)
-                if policy.all_reruns_need_to_pass is not None:
-                    all_reruns_need_to_pass = policy.all_reruns_need_to_pass
+                reruns, all_reruns_need_to_pass = _get_rerun_settings(item)
+                db.set_test_reruns(item.nodeid, reruns)
 
         for report in reports:  # 3 reports: setup, call, teardown
             report.rerun = item.execution_count - 1
-
-            # Track initial failure for all_reruns_need_to_pass mode
-            if (
-                all_reruns_need_to_pass
-                and report.when == "call"
-                and report.failed
-                and item.execution_count == 1
-            ):
-                initial_failure_occurred = True
 
             # Track rerun results (after initial failure) - only track call phase
             if (
@@ -754,10 +789,9 @@ def pytest_runtest_protocol(item, nextitem):
             # In all_reruns_need_to_pass mode with initial failure,
             # override normal behavior
             if all_reruns_need_to_pass and initial_failure_occurred:
-                # execution_count starts at 1, so:
-                # - execution_count==1: initial run (failed)
-                # - execution_count==2..reruns+1: reruns (must run all of them)
-                is_last_rerun = item.execution_count > reruns
+                # The initial run (execution_count==1) failed and every rerun after it
+                # must run. A rerun that never reaches its call phase ends it too.
+                is_last_rerun = not _will_rerun(item)
 
                 if is_last_rerun:
                     # Last run, check if all reruns passed
