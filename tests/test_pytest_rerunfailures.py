@@ -39,7 +39,7 @@ def events_fixture(scope="session"):
         import pytest
 
         @pytest.fixture(scope="{scope}", autouse=True)
-        def events():
+        def {scope}_events():
             path = py.path.local(__file__).dirpath().ensure("events.txt")
             path.write(path.read() + "setup\\n")
             yield
@@ -1855,7 +1855,37 @@ def test_all_reruns_need_to_pass_only_started_by_a_failing_first_call(testdir):
     )
     result = testdir.runpytest("--reruns", "3", "--all-reruns-need-to-pass")
     assert_outcomes(result, passed=2, rerun=2)
-    assert read_events(testdir)[-1] == "teardown"
+    # The first attempt's teardown cannot tell that its own teardown is about to fail,
+    # so that attempt tears the session down once; the passing third attempt ends it.
+    assert read_events(testdir) == ["setup", "teardown", "setup", "teardown"]
+
+
+def test_all_reruns_need_to_pass_item_run_twice_starts_a_fresh_sequence(testdir):
+    """A failing first attempt of one run does not arm the next run of the same item."""
+    testdir.makeconftest(
+        """
+        def pytest_collection_modifyitems(items):
+            items[:] = [items[0], items[1], items[0]]"""
+    )
+    testdir.makepyfile(
+        """
+        import py
+
+        def test_a():
+            path = py.path.local(__file__).dirpath().ensure('test.res')
+            count = int(path.read() or 0)
+            path.write(count + 1)
+            # First run: fail, pass, pass. Second run: the fourth call passes, and
+            # a fifth would fail if that run were a rerun sequence.
+            if count in (0, 4):
+                raise Exception(f'Fail on call {count}')
+
+        def test_b():
+            pass
+        """
+    )
+    result = testdir.runpytest("--reruns", "2", "--all-reruns-need-to-pass")
+    assert_outcomes(result, passed=3, rerun=2)
 
 
 def test_rerun_policy_lowered_budget_tears_fixtures_down_once(testdir):
@@ -1871,6 +1901,45 @@ def test_rerun_policy_lowered_budget_tears_fixtures_down_once(testdir):
     result = testdir.runpytest("--reruns", "3")
     assert_outcomes(result, passed=0, failed=1, rerun=1)
     assert read_events(testdir) == ["setup", "teardown"]
+
+
+@pytest.mark.parametrize(
+    "policy_args", ["reruns=1", "reruns=1, all_reruns_need_to_pass=False"]
+)
+def test_rerun_policy_raised_from_zero_tears_fixtures_down_once(testdir, policy_args):
+    """A policy can raise a zero rerun count, and the fixtures stay for that rerun."""
+    testdir.makeconftest(
+        events_fixture()
+        + f"""
+        from pytest_rerunfailures import RerunPolicy
+        def pytest_rerunfailures_rerun_policy(item, report, call):
+            return RerunPolicy({policy_args})"""
+    )
+    testdir.makepyfile(
+        f"""
+        def test_flaky():
+            {temporary_failure()}"""
+    )
+    result = testdir.runpytest("--reruns", "0", "--all-reruns-need-to-pass")
+    assert_outcomes(result, passed=1, rerun=1)
+    assert read_events(testdir) == ["setup", "teardown"]
+
+
+def test_rerun_flaky_condition_false_tears_fixtures_down(testdir):
+    """A false condition ends the sequence at the first failure: fixtures go down."""
+    testdir.makeconftest(events_fixture() + events_fixture(scope="module"))
+    testdir.makepyfile(
+        """
+        import pytest
+
+        @pytest.mark.flaky(reruns=2, condition=False)
+        def test_fail():
+            raise Exception('boom')
+        """
+    )
+    result = testdir.runpytest()
+    assert_outcomes(result, passed=0, failed=1)
+    assert read_events(testdir) == ["setup", "setup", "teardown", "teardown"]
 
 
 @pytest.mark.parametrize("mark_params", ["", "reruns=1"])

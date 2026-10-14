@@ -456,10 +456,12 @@ def _get_rerun_settings(item):
 def _will_rerun(item):
     """Return whether another attempt of item follows the one in progress.
 
-    The protocol loop and pytest_runtest_teardown both ask this. The teardown runs
-    before the loop decides, so it needs the answer from what the attempt has done so
-    far: an all-reruns-need-to-pass sequence reruns after a passing attempt too, and
-    higher-scoped fixtures must stay alive for that rerun.
+    pytest_runtest_teardown asks this to keep higher-scoped fixtures alive for that
+    attempt, and the all-reruns-need-to-pass branch of the protocol loop to find the
+    last attempt. The teardown runs before the loop decides, so the answer comes from
+    the attempt's setup and call phases. An all-reruns-need-to-pass sequence reruns
+    after a passing attempt too; otherwise only a failure reruns, as in
+    _should_not_rerun, which the loop uses for those items.
     """
     reruns, all_reruns_need_to_pass = _get_rerun_settings(item)
     _test_failed_statuses = getattr(item, "_test_failed_statuses", {})
@@ -467,12 +469,13 @@ def _will_rerun(item):
         # every attempt that reaches its call phase is followed by a rerun until the
         # reruns are used up, whatever its outcome
         return item.execution_count <= reruns and "call" in _test_failed_statuses
-    # Exceeding re-run limits, being free of failue statuses, and encountering
-    # allowable exceptions indicate that the test is not to be re-ran.
+    # Exceeding re-run limits, being free of failure statuses, encountering allowable
+    # exceptions, and a false condition indicate that the test is not to be re-ran.
     return (
         item.execution_count <= reruns
         and any(_test_failed_statuses.values())
         and not any(item._terminal_errors.values())
+        and get_reruns_condition(item)
     )
 
 
@@ -741,6 +744,7 @@ def pytest_runtest_protocol(item, nextitem):
     parallel = not is_master(item.config)
     db = item.session.config.failures_db
     item.execution_count = db.get_test_failures(item.nodeid)
+    item._initial_call_failed = False
     db.set_test_reruns(item.nodeid, reruns)
 
     if item.execution_count > reruns:
@@ -785,9 +789,8 @@ def pytest_runtest_protocol(item, nextitem):
             # In all_reruns_need_to_pass mode with initial failure,
             # override normal behavior
             if all_reruns_need_to_pass and initial_failure_occurred:
-                # execution_count starts at 1, so:
-                # - execution_count==1: initial run (failed)
-                # - execution_count==2..reruns+1: reruns (must run all of them)
+                # The initial run (execution_count==1) failed and every rerun after it
+                # must run. A rerun that never reaches its call phase ends it too.
                 is_last_rerun = not _will_rerun(item)
 
                 if is_last_rerun:
